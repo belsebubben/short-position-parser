@@ -1,0 +1,250 @@
+#!/home/carl/Code/blankningsparser/bin/python3.5
+###!/usr/bin/env python3
+
+import sys
+import xlrd
+from xlrd.sheet import ctype_text
+from operator import attrgetter
+import datetime
+import time
+from difflib import SequenceMatcher
+from urllib.request import urlretrieve,urlopen
+from os.path import isfile
+from collections import namedtuple
+try:
+    from html.parser import HTMLParser
+except:
+    from HTMLParser import HTMLParser
+
+MERGEHOLDERS = False
+
+def sheet_lister(workbook):
+    #print(workbook.sheet_names())
+    return workbook.sheet_by_name('Blankningar fi.se')
+
+def first_row(sheet):
+    '''
+    (Column #) type:value
+    (0) text Publicerat
+    (Publication date)
+    (1) text Innehavare av positionen
+    (Position holder)
+    (2) text Namn på emittent
+    (Name of the issuer)
+    (3) text ISIN
+    (4) text Procent* (Per cent)*
+    (5) text Datum för positionen (Position date)
+    (6) text Kommentar
+    (Comment)
+
+    '''
+    row = sheet.row(6)  # 1st row
+    #print('(Column #) type:value')
+    for idx, cell_obj in enumerate(row[:9]):
+        cell_type_str = ctype_text.get(cell_obj.ctype, 'unknown type')
+        #print('(%s) %s %s' % (idx, cell_type_str, cell_obj.value),end='; ')
+
+def open_book(filename):
+    workbook = xlrd.open_workbook(filename)
+    return workbook
+
+def warn_print(string):
+    ''' prints in red'''
+    print('\033[1;31m' + string + '\033[1;m')
+
+# make named tuple
+def parser(wsheet, datemode):
+    # make named tuple with latest date and also the institution and if they are increasing or decreasing
+    shortlist = {}
+    for row_idx in reversed(range(7, wsheet.nrows)):
+
+        # Get csv values
+        holder = wsheet.cell(row_idx,1).value.upper()
+        company = wsheet.cell(row_idx,2).value.upper().replace(' AB','').strip()
+        isin = wsheet.cell(row_idx,3).value.strip()
+        prcnt = str(wsheet.cell(row_idx,4).value).replace(',','.')
+        #print('PRCNT', prcnt) # DEBUG
+
+        # tidy the holder name, make it easier to match the lying ppl
+        junkWords = ['ASSET', 'MANAGEMENT', 'CAPITAL', 'INVESTMENT', 'LLP', 'LLC', 'LIMITED', ',', 'LP', '(UK)', 'LTD', 'EUROPE', 'PARTNERS', 'ADVISORS', 'FUND', 'INTERNATIONAL', 'L.P.', 'L.L.C.']
+        for word in junkWords:
+            holder = holder.replace(word, '')
+        holder = holder.strip('.').strip()
+        
+        # Parse date
+        if ctype_text.get(wsheet.cell(row_idx,5).ctype, 'unknown type') in 'text':
+            date = datetime.datetime.strptime(wsheet.cell(row_idx,5).value, '%Y-%m-%d')
+        elif ctype_text.get(wsheet.cell(row_idx,5).ctype, 'unknown type') in 'xldate':
+            date = datetime.datetime(*xlrd.xldate_as_tuple(wsheet.cell(row_idx,5).value, datemode))
+
+        #print(company, prcnt ) # debug
+        try:
+            if isin in shortlist:
+
+                # loop over previos holders and try to match
+                if MERGEHOLDERS:
+                    for previous_holder in shortlist[isin]['Holders']:
+                        matchRatio = SequenceMatcher(lambda x: x == ' ', holder, previous_holder).ratio()
+                        if matchRatio > 0.6 and holder != previous_holder:
+                            warn_print("Merging duplicate holder %s with %s; Match %.2f%% " % (holder, previous_holder, matchRatio))
+                            holder = previous_holder
+
+
+                if holder in shortlist[isin]['Holders']:
+                    if shortlist[isin]['Holders'][holder]['Holding'] < float(prcnt):
+                        shortlist[isin]['Holders'][holder]['Increasing'] +=1
+
+                    if shortlist[isin]['Holders'][holder]['Holding'] > float(prcnt):
+                        shortlist[isin]['Holders'][holder]['Increasing'] -= 1
+
+                    shortlist[isin]['Holders'][holder]['Holding'] = float(prcnt)
+                    shortlist[isin]['Holders'][holder]['RowNr'] = row_idx
+
+                else:
+                    shortlist[isin]['Holders'][holder] = {}
+                    shortlist[isin]['Holders'][holder]['Holding'] = float(prcnt)
+                    shortlist[isin]['Holders'][holder]['Increasing'] = 0
+                    shortlist[isin]['Holders'][holder]['RowNr'] = row_idx
+            else:
+            # First time company seen
+                shortlist[isin] = {}
+                shortlist[isin]['Holders'] = {}
+                shortlist[isin]['Name'] = company
+                shortlist[isin]['Isin'] = isin
+                shortlist[isin]['Total'] = 0
+                shortlist[isin]['Holders'][holder] = {}
+                shortlist[isin]['Holders'][holder]['Holding'] = float(prcnt)
+                shortlist[isin]['Holders'][holder]['Increasing'] = 0
+                shortlist[isin]['Holders'][holder]['RowNr'] = row_idx
+        except Exception as err:
+            print(err, ';', ';'.join((company,holder,isin,prcnt)) )
+
+    return shortlist
+
+def print_Result(result):
+    print('Name: %s\tIsin: %s\tTotal: %.2f%%' %  ( result['Name'], result['Isin'], result['Total']))
+    for holder in result['Holders']:
+        print( (holder + ": ").ljust(30), 'Holding: ', result['Holders'][holder]['Holding'], 'Increasing: ', result['Holders'][holder]['Increasing']  )
+    print()
+
+def merge_Results(search_results):
+    '''When we have several ISIN with the same company we merge the results'''
+    final_result = {}
+    for i,res in enumerate(search_results,1):
+        print("Nr: ", i)
+        print_Result(res)
+    # First entry
+    pickedname = search_results[0]['Name']
+    final_result['Name'] = pickedname
+    final_result['Isin'] = search_results[0]['Isin']
+    final_result['Holders'] = search_results[0]['Holders']
+    final_result['Increasing'] = 0
+    final_result['Total'] = 0
+    for holder in final_result['Holders']:
+        final_result['Total'] += final_result['Holders'][holder]['Holding']
+        final_result['Increasing'] += final_result['Holders'][holder]['Increasing']
+
+    names = [pickedname]
+    isins = [search_results[0]['Isin']]
+    search_results.pop(0)
+
+    #print(search_results)
+    #print(final_result)
+    for company in search_results:
+        names.append(company['Name'])
+        isins.append(company['Isin'])
+
+        for holder in company['Holders']:
+            if holder in final_result['Holders']: # Existing holder
+                if company['Holders'][holder]['Holding'] < final_result['Holders'][holder]['Holding']:  ## base on lowest row nr
+                    if company['Holders'][holder]['RowNr'] <  final_result['Holders'][holder]['RowNr']:
+                        final_result['Holders'][holder]['Increasing'] -=1
+                        final_result['Increasing'] -=1
+                    else:
+                        final_result['Holders'][holder]['Increasing'] +=1
+                        final_result['Increasing'] -=1
+            else: # New holder
+                final_result['Holders'][holder] = company['Holders'][holder]
+
+
+    for holder in final_result['Holders']:
+        final_result['Total'] += final_result['Holders'][holder]['Holding']
+    print('Merged Names', names)
+    print('Merged Isins', isins)
+    print('Merged Result')
+    print_Result(final_result)
+
+def parse_shortlist(shortlist,search):
+    search_results = []
+    print('\nResults\n')
+    if search:
+        for company in sorted(shortlist):
+            if search.upper() in shortlist[company]['Name']:
+                increasing = 0
+                total = 0
+                search_results.append(shortlist[company])
+                #print(shortlist[company]['Name'].ljust(30), shortlist[company])
+                for holder in shortlist[company]['Holders']:
+                    increasing += shortlist[company]['Holders'][holder]['Increasing']
+                    shortlist[company]['Total'] += shortlist[company]['Holders'][holder]['Holding']
+
+        merge_Results(search_results)
+    else:
+        for company in shortlist:
+            if shortlist[company]['Name'] in '': continue
+            #print(company, shortlist[company]) # DEBUG
+            for holder in shortlist[company]['Holders']:
+                shortlist[company]['Total'] += shortlist[company]['Holders'][holder]['Holding']
+        print(shortlist[company]['Name'].ljust(30), shortlist[company])
+        print('Total:', shortlist[company]['Total'])
+        print('Increasing:', shortlist[company]['Increasing'])
+        print()
+
+class FiParser(HTMLParser):
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.contenturl = ""
+
+    def handle_starttag(self, tag, attrs):
+        #print("Encountered a start tag:", tag) # DEBUG
+        #print("Attrs tag:", attrs) # DEBUG
+        if tag == 'a':
+            for attr, value in attrs:
+                if attr == 'href' and 'xlsx' in value:
+                    self.contenturl = value
+
+
+def get_blankningar_xls():
+    tmpdir = '/tmp/'
+    xlsfilename = 'korta_positioner_%s.xlsx' %  time.strftime("%Y-%m-%d")
+    if isfile(tmpdir + xlsfilename):
+        return tmpdir + xlsfilename
+
+    blankurl = 'http://www.fi.se/sv/vara-register/blankning/'
+    xlsp = FiParser()
+    ficont = urlopen(blankurl).read()
+    xlsp.feed(str(ficont))
+    contenturl = xlsp.contenturl
+    xlsurl = 'http://www.fi.se' + contenturl
+
+    print("Retreiving: ", xlsurl)
+    xlsfile, httpstat = urlretrieve(xlsurl, '/tmp/' + xlsfilename)
+    return xlsfile
+
+def main():
+    search = ''
+    if len(sys.argv) > 1:
+        search = sys.argv[1]
+
+
+    xlsfile = get_blankningar_xls()
+    #workbook = open_book(filename)
+    workbook = open_book(xlsfile)
+    wsheet = sheet_lister(workbook)
+    colnames = first_row(wsheet)
+    shortlist = parser(wsheet,workbook.datemode)
+    parse_shortlist(shortlist,search)
+
+
+if __name__ == '__main__':
+    main()
