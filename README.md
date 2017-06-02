@@ -5,14 +5,14 @@ works with stocks on the swedish stock market. Will retreive and parse a stock s
 short positions above 0.5% of company have to be reported in sweden to finansinspektionen (fi.se) so information is public. However many holders have positions and it can be a bit daunting to get a good picture of the totals and how institutions are positioning themselves
 
 ## requirements
-a unix system
-requirements python3 
-xlrd==1.0.0
-xlwt==1.2.0
+a unix system  
+python3  
+xlrd==1.0.0  
+xlwt==1.2.0  
 
 ## usage example
 ### part of the company name like (skf or volv should be enough)
-short-position-parser atlas
+short-position-parser atlas  
 Retreiving:  http://www.fi.se/contentassets/71a61417bb4c49c0a4a3a2582ea8af6c/korta_positioner_2017-06-01.xlsx
 could not convert string to float:  ; ;;;
 'Holding' ; ;;;
